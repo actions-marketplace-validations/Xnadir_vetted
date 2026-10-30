@@ -263,6 +263,186 @@ test("sec: scoped allowed-tools are fine", () => {
   assert.ok(!rules(make("scoped", good("\nallowed-tools: Bash(git:*) Read"))).includes("warn:sec/broad-allowed-tools"));
 });
 
+test("sec: git force pushes and hard resets warn without confirmation", () => {
+  const commands = [
+    "git push --force", "git push origin main --force", "git push -f origin main",
+    "git push --force-with-lease --force origin main", "git reset --hard", "git reset HEAD~1 --hard",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`git-risk-${i}`, good(), `\nRun \`${command}\` without asking.\n`);
+    assert.ok(rules(r).includes("warn:sec/git-force-push"), command);
+  }
+});
+
+test("sec: git risk ignores safe operations and option lookalikes", () => {
+  const commands = [
+    "git push origin main", "git reset --soft HEAD~1", "git reset --mixed HEAD~1",
+    "git push --force-with-lease", "git push --force-with-lease=main:abc123",
+    "git push --force-if-includes", "git push --forceful", "git reset --harder",
+    "mygit push --force", "git push -- --force", "git push; echo --force",
+    "git push origin main # --force", "git reset HEAD # --hard",
+    "git push origin main` and describe `--force", "git reset HEAD; echo --hard",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`git-safe-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/git-force-push"), command);
+  }
+});
+
+test("sec: explicit confirmation first keeps git risk visible as info", () => {
+  const bodies = [
+    "Ask the user for confirmation first.\nRun `git push --force`.",
+    "Get explicit user approval before proceeding.\nRun `git reset --hard`.",
+    "Run `git push --force` only after user confirmation.",
+    "Before running `git reset --hard`, ask the user for confirmation.",
+    "Ask the user for confirmation first, then run `git push --force`.",
+    "Run `git --no-pager push --force` only after user confirmation.",
+    "Confirm with the user first.\n\n```sh\ngit push --force\n```",
+  ];
+  for (const [i, body] of bodies.entries()) {
+    const r = make(`git-confirmed-${i}`, good(), `\n${body}\n`);
+    const f = r.findings.find((x) => x.rule === "sec/git-force-push");
+    assert.ok(f, body);
+    assert.equal(f.severity, "info", body);
+    assert.match(f.message, /confirmation/i);
+  }
+});
+
+test("sec: git confirmation must be nearby and govern the risky action", () => {
+  const bodies = [
+    "Ask the user for confirmation first.\n\n\n\nRun `git push --force`.",
+    "Run `git push --force`.\nAsk the user for confirmation first.",
+    "Ask the user for confirmation first.\n## Another task\nRun `git reset --hard`.",
+    "Ask the user for confirmation before editing the config.\nRun `git push --force`.",
+    "Ask the user for confirmation before running git reset.\nRun `git push --force`.",
+    "No user confirmation is required before proceeding.\nRun `git reset --hard`.",
+    "Do not ask the user for confirmation first.\nRun `git push --force`.",
+    "Run `git push --force` without user confirmation.",
+    "Run `git push --force`, then ask the user for confirmation.",
+    "Run `git push --force`, then ask the user for confirmation first.",
+    "After running git push, ask the user for confirmation first.\nRun `git push --force`.",
+    "Before proceeding, run `git push --force`; then ask the user for confirmation.",
+    "Ask the user for confirmation for editing the config first.\nRun `git push --force`.",
+    "Ask the user for confirmation first.\nRun `git reset --soft HEAD~1`.\nRun `git push --force`.",
+    "Do not ask the user for confirmation first; run `git push --force`.",
+    "Never ask before running `git push --force`.",
+    "Do not ask for confirmation before running `git reset --hard`.",
+    "Ask the user for confirmation first.\nRun `git push --force` without asking.",
+  ];
+  for (const [i, body] of bodies.entries()) {
+    const r = make(`git-unconfirmed-${i}`, good(), `\n${body}\n`);
+    assert.ok(rules(r).includes("warn:sec/git-force-push"), body);
+  }
+});
+
+test("sec: git risk reports each command's file and line", () => {
+  const r = make("git-script", good(), undefined, {
+    "scripts/update.sh": "#!/bin/sh\ngit push --force origin main\ngit reset --hard HEAD~1\n",
+  });
+  const findings = r.findings.filter((f) => f.rule === "sec/git-force-push");
+  assert.deepEqual(findings.map(({ severity, file, line }) => ({ severity, file, line })), [
+    { severity: "warn", file: "scripts/update.sh", line: 2 },
+    { severity: "warn", file: "scripts/update.sh", line: 3 },
+  ]);
+});
+
+test("sec: git risk recognizes quoted arguments and common global options", () => {
+  const commands = [
+    'git push "origin" main --force', "git push 'origin' main -f",
+    'git reset "HEAD~1" --hard', 'git push "origin;backup" main --force',
+    "git -C repo push --force", 'git -C "my repo" reset --hard',
+    'git -c "push.default=current" push --force', "git --git-dir=repo/.git push -f",
+    'git --work-tree "my repo" reset --hard', "git --no-pager -C repo reset --hard",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`git-arguments-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(rules(r).includes("warn:sec/git-force-push"), command);
+  }
+});
+
+test("sec: Git confirmation belongs to the matched action on a shared line", () => {
+  const cases = [
+    ["Run `git reset --hard; git push --force` only after user confirmation.", ["warn", "info"]],
+    ["Ask the user for confirmation before running git reset --soft; then run `git push --force`.", ["warn"]],
+    ["Ask the user for confirmation first; run `git reset --soft`; run `git push --force`.", ["warn"]],
+    ["Ask the user for confirmation first; run `git reset --hard`; run `git push --force`.", ["info", "warn"]],
+    ["Run `git reset --hard` without asking; run `git push --force` only after user confirmation.", ["warn", "info"]],
+    ["Ask the user for confirmation first.\nRun `git -C repo reset --soft`; run `git -C repo push --force`.", ["warn"]],
+    ["Ask the user for confirmation first; run `git reset --soft`.\nRun `git push --force`.", ["warn"]],
+    ["Run `git -C repo push --force`, ask the user for confirmation first.", ["warn"]],
+    ['Run `git -C "my repo" reset --hard; git --no-pager -C "my repo" push --force` only after user confirmation.', ["warn", "info"]],
+    ["Run `git --no-pager push --force` without user confirmation.", ["warn"]],
+    ["No user confirmation is required.\nRun `git --no-pager push --force`.", ["warn"]],
+  ];
+  for (const [i, [body, want]] of cases.entries()) {
+    const r = make(`git-action-scope-${i}`, good(), `\n${body}\n`);
+    // Findings are sorted by severity; assert each action's severity instead
+    // of depending on the report order when one is info and the other warns.
+    const found = r.findings.filter((f) => f.rule === "sec/git-force-push");
+    const got = ["reset", "push"].flatMap((action) => found.filter((f) => new RegExp(`\\b${action}\\b`).test(f.message)).map((f) => f.severity));
+    assert.deepEqual(got, want, body);
+  }
+});
+
+test("sec: quoted Git arguments and global options preserve command boundaries", () => {
+  const commands = [
+    'git push "origin" main; echo --force', 'git reset "HEAD~1" # --hard',
+    'git -C "my repo" push --force-with-lease', 'git --work-tree "my repo" reset --soft',
+    'git -C repo push -- --force', 'git -C repo push origin` then mention `--force',
+    'git -c "alias.force=push --force" status',
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`git-quoted-safe-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/git-force-push"), command);
+  }
+});
+
+test("sec: blocked Git commands in a defensive reference table stay informational", () => {
+  // microsoft/skills azure-app-onboard/deploy/references/blocked-patterns.md:
+  // keep the real rows that the maintainer's scan reported, with a neutral heading.
+  const table = [
+    "| Pattern | Action | Reason |",
+    "|---------|--------|--------|",
+    "| `git reset --hard`, `git checkout -- <path>`, `git restore`, `git clean` | ⛔ Block | Discards uncommitted work. During region-fallback healing the agent edits Bicep/app config; these wipe the user's unstaged changes irrecoverably. |",
+    "| `git push --force` / `--force-with-lease` (any branch) | ⛔ Block | Prevents force-push of generated code over remote history. |",
+  ].join("\n");
+  const r = make("git-blocked-table", good(), undefined, {
+    "references/commands.md": table,
+  });
+  const findings = r.findings.filter((f) => f.rule === "sec/git-force-push");
+  assert.deepEqual(findings.map(({ severity, file, line }) => ({ severity, file, line })), [
+    { severity: "info", file: "references/commands.md", line: 3 },
+    { severity: "info", file: "references/commands.md", line: 4 },
+  ]);
+});
+
+test("sec: defensive wording cannot hide a Git confirmation bypass", () => {
+  const bodies = [
+    "Never ask, just run `git push --force`.",
+    "Do not ask for confirmation; run `git reset --hard`.",
+    "Avoid asking the user before running `git push --force`.",
+    "Run `git push --force` and never ask the user.",
+    "Run `git reset --hard` without asking; avoid stopping the workflow.",
+  ];
+  for (const [i, body] of bodies.entries()) {
+    const r = make(`git-defensive-bypass-${i}`, good(), `\n${body}\n`);
+    const findings = r.findings.filter((f) => f.rule === "sec/git-force-push");
+    assert.equal(findings.length, 1, body);
+    assert.equal(findings[0].severity, "warn", body);
+  }
+});
+
+test("sec: git cautionary examples and suppressions remain visible", () => {
+  for (const [i, body] of [
+    "Never run `git reset --hard`.",
+    "<!-- vet-ignore: sec/git-force-push -->\nRun `git push --force`.",
+  ].entries()) {
+    const r = make(`git-mention-${i}`, good(), `\n${body}\n`);
+    assert.ok(rules(r).includes("info:sec/git-force-push"), body);
+    assert.ok(!rules(r).includes("warn:sec/git-force-push"), body);
+  }
+});
+
 test("cross-skill: name collisions only within one skill root", () => {
   const a = vetSkill(box.skill("root1/alpha", `name: same\ndescription: ${GOOD_DESC}`));
   const b = vetSkill(box.skill("root1/beta", `name: same\ndescription: Something else entirely. Use when needed for other work.`));
@@ -330,6 +510,171 @@ test("sec: suspicious-install stops at the closing backtick of inline code", () 
   // Seen in microsoft/skills: a list of forbidden commands, each in its own backticks.
   const r = make("inline-list", good(), "\nNever run `npm install`, `npm test`, `pytest`, or `pip install` here.\n");
   assert.ok(!rules(r).includes("warn:sec/suspicious-install"), "pytest must not be flagged as a typosquat of itself");
+});
+
+test("sec: unpinned-install reports bare npm global, pip, and cargo installs", () => {
+  const commands = [
+    "npm install -g serve", "npm i --global @scope/tool", "npm install serve -g",
+    "pip install requests", "pip3 install package.name[extra]", "cargo install ripgrep",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-hit-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(rules(r).includes("info:sec/unpinned-install"), command);
+  }
+});
+
+test("sec: unpinned-install accepts exact versions for each package manager", () => {
+  const commands = [
+    "npm install -g serve@14.2.4", "npm i --global @scope/tool@1.2.3",
+    "npm install -g serve@1.2.3-beta.1", "pip install requests==2.32.3",
+    "pip3 install 'requests[security]==2.32.3'", 'pip install "package.name===1.0-custom"',
+    "cargo install ripgrep --version 14.1.1", "cargo install --version=14.1.1 ripgrep",
+    'cargo install ripgrep --version="14.1.1"', 'pip install requests=="2.32.3"',
+    'npm install -g serve@"14.2.4"',
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-pin-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"), command);
+  }
+});
+
+test("sec: unpinned-install reports tags, ranges, and wildcard versions", () => {
+  const commands = [
+    "npm install -g serve@latest", "npm install -g @scope/tool@next",
+    "npm install -g serve@^14.2.4", "npm install -g serve@14.*", "npm install -g serve@14",
+    "pip install 'requests>=2.32.3'", "pip install 'requests~=2.32'",
+    "pip install requests==2.*", "pip install requests!=2.32.3",
+    "cargo install ripgrep --version '^14.1.1'", "cargo install ripgrep --version=14.*",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-range-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(rules(r).includes("info:sec/unpinned-install"), command);
+  }
+});
+
+test("sec: unpinned-install skips local installs, requirement files, and option values", () => {
+  const commands = [
+    "npm install serve", "npm install -g", "npm install -g ./tool",
+    "npm install -g --prefix /tmp/tools serve@14.2.4", "npm install -g --registry https://example.com serve@14.2.4",
+    "npm install -g tool.tgz", "pip install package.whl", "pip install package.tar.gz",
+    "pip install -r requirements.txt", "pip install --requirement requirements.txt",
+    "pip install -rrequirements.txt", "pip install -e ./project", "pip install ./project",
+    "pip install --index-url https://example.com/simple requests==2.32.3",
+    "pip install -f wheels requests==2.32.3", "pip install --find-links wheels requests==2.32.3",
+    "cargo install --path ./tool", "cargo install --git https://example.com/tool.git",
+    "cargo install --list", "mynpm install -g serve", "mypip install requests",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-skip-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"), command);
+  }
+});
+
+test("sec: unpinned-install reports only unpinned packages in mixed commands", () => {
+  const r = make("unpinned-mixed", good(), "\nRun `npm install -g serve@14.2.4 @scope/tool`.\n");
+  const found = r.findings.filter((f) => f.rule === "sec/unpinned-install");
+  assert.equal(found.length, 1);
+  assert.match(found[0].message, /@scope\/tool/);
+  assert.match(found[0].message, /pin/i);
+});
+
+test("sec: unpinned-install stops at shell and inline-code boundaries", () => {
+  const commands = [
+    "pip install requests==2.32.3 && python run.py", "npm install -g serve@14.2.4; echo tool",
+    "pip install requests==2.32.3 | tee log", "cargo install ripgrep --version 14.1.1 # tool",
+    "pip install requests==2.32.3 > log", "npm install -g serve@14.2.4 & echo tool",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-boundary-${i}`, good(), `\nRun \`${command}\` then check the tool.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"), command);
+  }
+  const r = make("unpinned-next-command", good(), "\nRun `cargo install ripgrep && echo --version 14.1.1`.\n");
+  assert.ok(rules(r).includes("info:sec/unpinned-install"));
+});
+
+test("sec: unpinned-install reports script file and line", () => {
+  const r = make("unpinned-script", good(), undefined, { "scripts/setup.sh": "#!/bin/sh\npip install requests\n" });
+  const f = r.findings.find((x) => x.rule === "sec/unpinned-install");
+  assert.ok(f);
+  assert.equal(f.severity, "info");
+  assert.equal(f.file, "scripts/setup.sh");
+  assert.equal(f.line, 2);
+});
+
+test("sec: unpinned-install keeps cautionary examples, comments, and tests", () => {
+  const r = make("unpinned-examples", good(), "\nNever run `pip install requests`.\n", {
+    "scripts/setup.sh": "# pip install requests\n",
+    "test/setup.sh": "pip install requests\n",
+  });
+  const found = r.findings.filter((f) => f.rule === "sec/unpinned-install");
+  assert.equal(found.length, 3);
+  assert.ok(found.every((f) => f.severity === "info"));
+});
+
+test("sec: suppressing unpinned-install retains the informational finding", () => {
+  const r = make("unpinned-suppressed", good(), "\n<!-- vet-ignore: sec/unpinned-install -->\nRun `pip install requests`.\n");
+  const f = r.findings.find((x) => x.rule === "sec/unpinned-install");
+  assert.ok(f);
+  assert.equal(f.severity, "info");
+  assert.match(f.message, /suppressed in file/);
+});
+
+test("sec: unpinned-install checks subsequent commands with their own version flags", () => {
+  const r = make("unpinned-chain", good(), "\nRun `cargo install ripgrep && cargo install fd-find --version 10.2.0; pip install requests`.\n");
+  const found = r.findings.filter((f) => f.rule === "sec/unpinned-install");
+  assert.equal(found.length, 2);
+  assert.ok(found.some((f) => /ripgrep/.test(f.message)));
+  assert.ok(found.some((f) => /requests/.test(f.message)));
+});
+
+test("sec: unpinned-install treats force flags as boolean for npm and cargo", () => {
+  for (const [i, command] of ["npm install -g -f serve", "cargo install -f ripgrep"].entries()) {
+    const r = make(`unpinned-force-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(rules(r).includes("info:sec/unpinned-install"), command);
+  }
+});
+
+test("sec: unpinned-install accepts cargo exact selectors and version aliases", () => {
+  const commands = [
+    "cargo install ripgrep --version '=14.1.1'", "cargo install ripgrep --vers 14.1.1",
+    "cargo install ripgrep --vers='=14.1.1'",
+  ];
+  for (const [i, command] of commands.entries()) {
+    const r = make(`unpinned-cargo-selector-${i}`, good(), `\nRun \`${command}\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"), command);
+  }
+  const range = make("unpinned-cargo-alias-range", good(), "\nRun `cargo install ripgrep --vers '^14.1.1'`.\n");
+  assert.ok(rules(range).includes("info:sec/unpinned-install"));
+});
+
+test("sec: unpinned-install skips pip policy and output option values", () => {
+  const options = [
+    "--upgrade-strategy eager", "--progress-bar off", "--report install.json",
+    "--config-settings editable_mode=strict", "--root-user-action ignore",
+  ];
+  for (const [i, option] of options.entries()) {
+    const r = make(`unpinned-pip-options-${i}`, good(), `\nRun \`pip install ${option} requests==2.32.3\`.\n`);
+    assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"), option);
+  }
+});
+
+test("sec: unpinned-install reports bare pip requirements with environment markers", () => {
+  const r = make("unpinned-pip-marker", good(), '\nRun `pip install "requests; python_version >= \'3.10\'"`.\n');
+  const found = r.findings.filter((f) => f.rule === "sec/unpinned-install");
+  assert.equal(found.length, 1);
+  assert.match(found[0].message, /requests/);
+});
+
+test("sec: unpinned-install accepts exact pip requirements with environment markers", () => {
+  const r = make("unpinned-pip-marker-pin", good(), '\nRun `pip install "requests==2.32.3; python_version >= \'3.10\'"`.\n');
+  assert.ok(!r.findings.some((f) => f.rule === "sec/unpinned-install"));
+});
+
+test("sec: unpinned-install handles explicit npm global boolean values", () => {
+  const hit = make("unpinned-npm-global-true", good(), "\nRun `npm install --global=true serve`.\n");
+  assert.ok(rules(hit).includes("info:sec/unpinned-install"));
+  const miss = make("unpinned-npm-global-false", good(), "\nRun `npm install --global=false serve`.\n");
+  assert.ok(!miss.findings.some((f) => f.rule === "sec/unpinned-install"));
 });
 
 test("spec: links inside a fenced block indented under a list item are ignored", () => {

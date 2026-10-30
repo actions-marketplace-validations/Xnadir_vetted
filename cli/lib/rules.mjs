@@ -4,7 +4,8 @@
 // severity (error | warn | info), a message, and where possible a file and
 // line. Rules are grouped by prefix: spec/, trigger/, style/, cost/, sec/.
 
-import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { diskSource } from "./source.mjs";
 import { join, relative, resolve, sep, extname, basename, dirname } from "node:path";
 import { parseFrontmatter } from "./frontmatter.mjs";
 
@@ -64,6 +65,31 @@ const INSTALL_FLAGS_WITH_VALUE = new Set(["-r", "-e", "-c", "--index-url", "--fe
 const INSTALL_CMD_RE = /\b(npm\s+i(?:nstall)?|pip3?\s+install|cargo\s+add)\b/;
 // A closing backtick ends an inline-code command, so prose after it is not parsed.
 const INSTALL_SHELL_OP_RE = /&&|\|\||[;|#`]/;
+const UNPINNED_INSTALL_CMD_RE = /(?<![\w./-])(npm\s+i(?:nstall)?|pip3?\s+install|cargo\s+install)\b/g;
+// Short flags differ by manager: pip -f takes a source, npm/cargo -f means force.
+const UNPINNED_FLAGS_WITH_VALUE = {
+  npm: new Set(["--prefix", "--registry", "--cache", "--userconfig", "--proxy", "--https-proxy", "--loglevel", "--location"]),
+  pip: new Set([
+    "-r", "--requirement", "-e", "--editable", "-c", "--constraint", "-f", "--find-links",
+    "-i", "--index-url", "--extra-index-url", "--trusted-host", "-t", "--target", "--prefix",
+    "--root", "--cache-dir", "--proxy", "--cert", "--client-cert", "--timeout", "--retries",
+    "--log", "--platform", "--python-version", "--implementation", "--abi", "--only-binary",
+    "--no-binary", "--upgrade-strategy", "--progress-bar", "--report", "--config-settings", "-C",
+    "--root-user-action", "--exists-action", "--src", "--python", "--use-feature", "--use-deprecated",
+  ]),
+  cargo: new Set([
+    "--features", "-F", "--version", "--vers", "--git", "--path", "--branch", "--tag", "--rev",
+    "--bin", "--example", "--target", "--target-dir", "--root", "--registry", "--index",
+    "--jobs", "-j", "--profile", "--config",
+  ]),
+};
+const EXACT_INSTALL_VERSION_RE = /^v?\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/;
+const GIT_CONFIRMATION_BYPASS = /\b(?:without\s+(?:asking|(?:user\s+)?(?:confirmation|approval))|(?:never|do\s+not|don't|skip|avoid)\s+(?:ask(?:ing)?|confirm(?:ing)?)|no\s+(?:user\s+)?confirmation\s+(?:is\s+)?(?:needed|required))\b/i;
+// Quoted arguments may contain spaces or shell punctuation; a closing inline
+// backtick still ends the command. Recognize common global Git options too.
+const GIT_ARGUMENT = String.raw`(?:"[^"\n\x60]*"|'[^'\n\x60]*'|[^\s\x60"';&|#<>])+`;
+const GIT_PREFIX = String.raw`\bgit(?:[ \t]+(?:(?:-C|-c|--git-dir|--work-tree|--namespace)[ \t]+${GIT_ARGUMENT}|(?:--git-dir|--work-tree|--namespace|--config-env)=${GIT_ARGUMENT}|--(?:bare|no-pager|paginate|no-optional-locks|literal-pathspecs|no-replace-objects)))*[ \t]+`;
+const GIT_COMMAND_RE = new RegExp(`${GIT_PREFIX}(push|reset)\\b`, "g");
 
 // ---------------------------------------------------------------- security patterns
 
@@ -140,6 +166,14 @@ const SEC_PATTERNS = [
     re: /\bchmod\s+(?:(?:-[A-Za-z]+|--[a-z-]+|--)\s+)*(?:0?777|(?:[ugoa]*[-+=][rwxXst]*,)*[ugoa]*[ao][ugoa]*[+=][rwxXst]*w[rwxXst]*(?:,[ugoa]*[-+=][rwxXst]*)*)(?=\s|[`"';&|]|\.(?=\s|$)|$)/,
     msg: "makes files world-writable with chmod; use the narrowest permissions needed",
   },
+  {
+    rule: "sec/git-force-push",
+    severity: "warn",
+    // Exact option tokens; stop at shell operators, inline-code boundaries,
+    // or -- (end of options). --force-with-lease alone is not unconditional force.
+    re: new RegExp(`${GIT_PREFIX}(?:push(?:[ \\t]+(?!--(?:[ \\t]|$))${GIT_ARGUMENT})*[ \\t]+(?:--force|-f)|reset(?:[ \\t]+(?!--(?:[ \\t]|$))${GIT_ARGUMENT})*[ \\t]+--hard)(?=[\\s\\x60"';&|]|$)`),
+    msg: "can overwrite remote history or discard local changes; require user confirmation first",
+  },
 ];
 
 const HIDDEN_UNICODE = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|\uDB40[\uDC00-\uDC7F]/g;
@@ -169,17 +203,17 @@ const PERSONA = /\byou are (an? )?(expert|world[- ]class|senior|highly skilled|e
 
 // ---------------------------------------------------------------- helpers
 
-function listFiles(dir, root = dir, out = []) {
+function listFiles(dir, source, out = []) {
   let entries;
   try {
-    entries = readdirSync(dir, { withFileTypes: true });
+    entries = source.readdirSync(dir, { withFileTypes: true });
   } catch {
     return out;
   }
   for (const e of entries) {
     const p = join(dir, e.name);
     if (e.isDirectory()) {
-      if (!SKIP_DIRS.has(e.name)) listFiles(p, root, out);
+      if (!SKIP_DIRS.has(e.name)) listFiles(p, source, out);
     } else if (e.isFile()) out.push(p);
   }
   return out;
@@ -219,7 +253,8 @@ const ruleMatches = (set, rule) =>
 
 // ---------------------------------------------------------------- main entry
 
-export function vetSkill(skillFile) {
+export function vetSkill(skillFile, { source = diskSource } = {}) {
+  const { readFileSync, existsSync, statSync } = source;
   const skillDir = dirname(resolve(skillFile));
   const text = readFileSync(skillFile, "utf8");
   const { data, body, bodyStartLine, warnings: parseWarnings, unterminated } = parseFrontmatter(text);
@@ -245,8 +280,8 @@ export function vetSkill(skillFile) {
       if (name.length > LIMITS.nameMax) add("spec/name-format", "error", `name is ${name.length} characters; the limit is ${LIMITS.nameMax}`);
       if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name))
         add("spec/name-format", "error", `name "${name}" must be lowercase letters, digits, and single hyphens, not starting or ending with a hyphen`);
-      const dirName = basename(skillDir);
-      if (dirName !== name) add("spec/name-dir-mismatch", "error", `name "${name}" doesn't match its directory "${dirName}"`);
+      const dirName = source.directoryName ? source.directoryName(skillDir) : basename(skillDir);
+      if (dirName !== null && dirName !== name) add("spec/name-dir-mismatch", "error", `name "${name}" doesn't match its directory "${dirName}"`);
     }
     if (!description) add("spec/description-missing", "error", "frontmatter has no `description`; agents use it to decide when to load the skill");
     else if (description.length > LIMITS.descriptionMax)
@@ -340,7 +375,7 @@ export function vetSkill(skillFile) {
     add("style/persona-boilerplate", "info", `"${persona[0]}" adds little for current models; describe the task, constraints, and why they matter instead`, "SKILL.md", bodyStartLine + lineOf(body, persona.index) - 1);
 
   // ---- security: every text file in the skill
-  const files = listFiles(skillDir);
+  const files = listFiles(skillDir, source);
   let resourceBytes = 0;
   for (const f of files) {
     const rel = relative(skillDir, f).split(sep).join("/");
@@ -386,13 +421,17 @@ export function vetSkill(skillFile) {
         const col = m.index - (content.lastIndexOf("\n", m.index - 1) + 1);
         if (p.rule === "sec/prompt-injection" && isQuotedMention(text, col)) {
           push(p.rule, "info", `quotes a prompt-injection phrase, apparently as an example: \`${snippet}\``, line);
-        } else if (isMarkdown && isNegatedOrCautionary(text, col)) {
+        } else if (p.rule === "sec/git-force-push" && hasGitConfirmation(lines, line - 1, col)) {
+          push(p.rule, "info", `(requires user confirmation first) ${p.msg}: \`${snippet}\``, line);
+        } else if (isMarkdown && isNegatedOrCautionary(text, col) &&
+          !(p.rule === "sec/git-force-push" && GIT_CONFIRMATION_BYPASS.test(text.slice(0, col)))) {
           push(p.rule, "info", `(negated or cautionary) ${p.msg}: \`${snippet}\``, line);
         } else if (p.severity === "warn" && !isMarkdown && isCodeComment(text)) {
           push(p.rule, "info", `(in a code comment) ${p.msg}: \`${snippet}\``, line);
         } else if (p.severity === "warn" && isTestFile(rel)) {
           push(p.rule, "info", `(in a test file) ${p.msg}: \`${snippet}\``, line);
-        } else if (p.severity === "warn" && isMarkdown && (isDefensive(text) || insideQuotes(text, col))) {
+        } else if (p.severity === "warn" && isMarkdown && ((isDefensive(text) &&
+          !(p.rule === "sec/git-force-push" && GIT_CONFIRMATION_BYPASS.test(text))) || insideQuotes(text, col))) {
           push(p.rule, "info", `(quoted or framed as something to block) ${p.msg}: \`${snippet}\``, line);
         } else {
           push(p.rule, p.severity, `${p.msg}: \`${snippet}\``, line);
@@ -404,6 +443,10 @@ export function vetSkill(skillFile) {
       for (const pkg of parseInstallPackages(lines[li])) {
         const hit = suspiciousInstallMatch(pkg);
         if (hit) push("sec/suspicious-install", "warn", `installs \`${pkg}\`, which is 1\u20132 edits from \`${hit}\`; verify it is not a typosquat`, li + 1);
+      }
+      for (const { pkg } of unpinnedInstallPackages(lines[li])) {
+        push("sec/unpinned-install", "info",
+          `installs \`${pkg}\` without an exact version pin; pin a reviewed version for reproducible installs`, li + 1);
       }
     }
     if (isMarkdown) {
@@ -440,6 +483,54 @@ export function vetSkill(skillFile) {
     },
     findings: kept.sort(bySeverity),
   };
+}
+
+// Confirmation must explicitly precede this action, on its own line or one of
+// the preceding three lines. A heading or intervening Git action ends the scope.
+// Keep findings visible as info, like cautionary security examples elsewhere.
+function hasGitConfirmation(lines, index, col) {
+  const commands = [...lines[index].matchAll(GIT_COMMAND_RE)];
+  const current = commands.findIndex((m) => m.index === col);
+  const action = commands[current][1];
+  const previous = commands[current - 1];
+  const next = commands[current + 1];
+  // Shell separators outside quoted arguments delimit the local action. Only
+  // the first action can inherit confirmation text from preceding lines.
+  const separators = [...lines[index].matchAll(/"[^"\n]*"|'[^'\n]*'|[;&|#]/g)]
+    .filter((m) => /^[;&|#]$/.test(m[0])).map((m) => m.index);
+  const start = previous ? (separators.filter((p) => p > previous.index && p < col).at(-1) ?? col - 1) + 1 : 0;
+  const end = next ? (separators.find((p) => p > col && p < next.index) ?? next.index) : lines[index].length;
+  const local = lines[index].slice(start, end);
+  if (GIT_CONFIRMATION_BYPASS.test(local)) return false;
+  const target = `(?:git\\s+${action}\\b|(?:this|the)\\s+command\\b)`;
+  const beforeAction = new RegExp(`\\bbefore\\s+(?:running|executing|using)\\s+${target}`, "i");
+  const before = new RegExp(`\\bbefore\\s+(?:proceeding\\b|continuing\\b|(?:running|executing|using)\\s+${target})`, "i");
+  const beforeAsk = new RegExp(`^\\s*before\\s+(?:proceeding|continuing|(?:running|executing|using)\\s+${target}[^,;.!?]*)[,]?\\s*$`, "i");
+  const request = /\b(?:ask(?:\s+the)?\s+user\s+(?:for\s+(?:explicit\s+)?(?:confirmation|approval)|to\s+confirm)|(?:get|obtain|require|wait\s+for)\s+(?:explicit\s+)?user\s+(?:confirmation|approval)|confirm\s+with(?:\s+the)?\s+user)\b/i;
+  for (let i = index; i >= Math.max(0, index - 3); i--) {
+    if (i < index && previous) break;
+    const text = (i === index ? local : lines[i]).replace(/`/g, "").trim();
+    if (/^(?:#{1,6}\s|---\s*$)/.test(text)) break;
+    const priorCommands = i < index ? [...text.matchAll(GIT_COMMAND_RE)] : [];
+    if (priorCommands.length && !(priorCommands.length === 1 && beforeAction.test(text) && !/[;&|]/.test(text))) break;
+    // The scanned file controls this context: merely mentioning confirmation,
+    // or instructing the agent to skip it, does not establish a requirement.
+    // Option names such as --no-pager describe Git behavior, not whether user
+    // confirmation is required. Keep actual negation words in the prose.
+    const confirmationText = text.replace(/--[A-Za-z][A-Za-z-]*(?:=[^\s]*)?/g, "");
+    if (!/\b(?:no|not|never|don't|without|skip|avoid|optional|unnecessary)\b/i.test(confirmationText)) {
+      const ask = request.exec(text);
+      if (ask) {
+        const prefix = text.slice(0, ask.index);
+        const suffix = text.slice(ask.index + ask[0].length);
+        const followsAction = /\b(?:after|then)\b/i.test(prefix) || [...prefix.matchAll(GIT_COMMAND_RE)].length > 0;
+        if ((!followsAction && (/^\s+first(?:[.,;:!]|$)/i.test(suffix) || before.test(suffix))) || beforeAsk.test(prefix)) return true;
+      }
+      if (i === index && /\bonly\s+after\s+(?:explicit\s+)?user\s+(?:confirmation|approval)\b/i.test(text)) return true;
+    }
+    if (i < index && [...text.matchAll(GIT_COMMAND_RE)].length) break;
+  }
+  return false;
 }
 
 // True when the match sits inside quotes on its line, or the line frames it
@@ -525,6 +616,55 @@ function parseInstallPackages(line) {
   return pkgs;
 }
 
+/** Find registry installs without exact versions; keep quoted selectors intact. */
+function unpinnedInstallPackages(line) {
+  const found = [];
+  for (const command of line.matchAll(UNPINNED_INSTALL_CMD_RE)) {
+    const manager = command[1].split(/\s/)[0];
+    const valueFlags = UNPINNED_FLAGS_WITH_VALUE[manager === "pip3" ? "pip" : manager];
+    const args = [];
+    const rest = line.slice(command.index + command[0].length);
+    for (const token of rest.matchAll(/(?:"[^"]*"|'[^']*'|[^\s"';&|#`])+|[;&|#`]/g)) {
+      if (/^[;&|#`]|^\d*[<>]/.test(token[0])) break;
+      args.push(token[0].replace(/["']/g, ""));
+    }
+    if (manager === "npm" && !args.some((arg) => arg === "-g" || arg === "--global" || arg === "--global=true")) continue;
+    if (manager === "cargo" && args.some((arg) => /^(--git|--path|--list)(=|$)/.test(arg))) continue;
+    const versionFlag = args.findIndex((arg) => /^--vers(?:ion)?(?:=|$)/.test(arg));
+    const cargoVersion = versionFlag < 0 ? "" : args[versionFlag].includes("=")
+      ? args[versionFlag].slice(args[versionFlag].indexOf("=") + 1) : args[versionFlag + 1] ?? "";
+    if (manager === "cargo" && EXACT_INSTALL_VERSION_RE.test(cargoVersion.replace(/^=\s*/, ""))) continue;
+    let skipNext = false;
+    for (const arg of args) {
+      if (skipNext) { skipNext = false; continue; }
+      if (valueFlags.has(arg)) { skipNext = true; continue; }
+      if (arg.startsWith("-")) continue;
+      if (/\.(tgz|tar\.gz|tar\.bz2|tar\.xz|zip|whl)$/i.test(arg)) continue;
+      let pkg;
+      let pinned = false;
+      if (manager === "npm") {
+        const spec = arg.match(/^((?:@[\w.-]+\/)?[\w-][\w.-]*)(?:@(.+))?$/);
+        if (!spec) continue;
+        pkg = spec[1];
+        pinned = EXACT_INSTALL_VERSION_RE.test(spec[2] ?? "");
+      } else if (manager === "cargo") {
+        if (!/^[\w-]+$/.test(arg)) continue;
+        pkg = arg;
+      } else {
+        // A quoted PEP 508 environment marker changes applicability, not the pin.
+        const requirement = arg.split(";", 1)[0].trim();
+        const spec = requirement.match(/^([\w-][\w.-]*(?:\[[\w,.-]+\])?)\s*([<>=!~].*)?$/);
+        if (!spec) continue;
+        pkg = spec[1];
+        // ==/=== select one version; ==1.* still selects a moving set.
+        pinned = /(?:^|,)\s*===?\s*[^*,\s<>=!~]+(?:\s*(?:,|$))/.test(spec[2] ?? "");
+      }
+      if (!pinned) found.push({ pkg, col: command.index });
+    }
+  }
+  return found;
+}
+
 /**
  * Returns the popular package that `pkg` appears to be a typosquat of, or null.
  * Uses distance-1 for short popular names (<=5 chars) and distance 1-2 for longer ones.
@@ -555,7 +695,7 @@ const STOP = new Set(
 );
 const tokenize = (s) => new Set(s.toLowerCase().match(/[a-z][a-z0-9-]+/g)?.filter((w) => !STOP.has(w) && w.length > 2) ?? []);
 
-export function crossSkillFindings(results) {
+export function crossSkillFindings(results, readText = (path) => readFileSync(path, "utf8")) {
   const extra = [];
   // Same name in different skill roots is normal (one copy per agent), so
   // only skills that share a parent directory can collide.
@@ -568,7 +708,7 @@ export function crossSkillFindings(results) {
   for (const group of byName.values()) {
     const name = group[0].name;
     if (group.length < 2) continue;
-    const distinct = new Set(group.map((g) => readFileSync(g.path, "utf8")));
+    const distinct = new Set(group.map((g) => readText(g.path)));
     if (distinct.size === 1) continue; // identical copies for different agents are fine
     for (const g of group)
       extra.push({ skill: g, finding: { rule: "trigger/duplicate-name", severity: "warn", message: `another skill is also named "${name}" with different content; agents will load only one of them`, file: "SKILL.md" } });
